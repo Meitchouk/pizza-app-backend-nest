@@ -1,0 +1,1513 @@
+/// ===============================================
+/// DOCUMENTACIÓN DEL ESQUEMA (Resumen General)
+/// ===============================================
+/// Sistema backend para una app de pizzería con:
+/// - Gestión de sucursales, usuarios, roles y permisos.
+/// - Catálogo de productos (incluye combos, modificadores y precios por sucursal).
+/// - Pedidos con múltiples canales de servicio y flujo de estados.
+/// - Pagos, cupones, facturación e historial de cambios.
+/// - Inventario básico vinculado a recetas (BOM) y movimientos.
+///
+/// -----------------------------------------------
+/// ENUMS
+/// -----------------------------------------------
+/// service_channel:
+///   - UNSET, DINE_IN, TAKEAWAY, DELIVERY.
+///   Indica canal operativo del pedido; permite análisis por canal.
+///
+/// order_status:
+///   - DRAFT -> CONFIRMED -> IN_KITCHEN -> READY -> (DELIVERING) -> COMPLETED / CANCELLED.
+///   Flujo flexible trazado en OrderStatusHistory.
+///
+/// payment_method:
+///   - CASH, CARD, TRANSFER, MIXED, OTHER.
+///
+/// payment_status:
+///   - PENDING, PAID, PARTIAL, REFUNDED, VOID.
+///   Soporta conciliación y devoluciones.
+///
+/// -----------------------------------------------
+/// PRINCIPALES ENTIDADES
+/// -----------------------------------------------
+/// Branch:
+///   Sucursal física. Controla activación lógica (isActive) y soft delete (deletedAt).
+///   Relaciones: usuarios, mesas, repartidores, precios de producto, inventario, pedidos, movimientos.
+///
+/// Role / Permission / RolePermission / UserRole:
+///   Modelo RBAC clásico. Permite asignar múltiples roles por usuario y permisos granularizados.
+///
+/// User:
+///   Usuario interno (cajero, mesero, administrador, etc.).
+///   Opcionalmente asignado a una sucursal. Soft delete y activación independiente.
+///   Relaciones a pedidos según rol en el flujo (waiter, cashier), historial de estados y pagos creados.
+///
+/// Customer / CustomerAddress:
+///   Cliente final y direcciones (para deliveries). Soporta múltiples direcciones etiquetadas (label) y geolocalización (geolat/geolng).
+///
+/// DiningTable:
+///   Mesas físicas en salón. Código único por sucursal para asignación de pedidos DINE_IN.
+///
+/// Courier:
+///   Repartidores asociados a una sucursal para pedidos DELIVERY.
+///
+/// -----------------------------------------------
+/// CATÁLOGO / PRODUCTOS
+/// -----------------------------------------------
+/// Category:
+///   Jerarquía (auto-relación parent/children) para segmentar productos.
+///
+/// Product:
+///   Producto base o combo (isCombo). Maneja precio base y porcentaje de impuesto.
+///   Soft delete y activación independiente para despublicar sin perder historial.
+///
+/// ProductComboComponent:
+///   Define composición de un combo (comboId -> componentId con qty).
+///
+/// ProductModifier / ProductModifierOption / ProductModifierLink:
+///   Sistema de modificadores configurables (ej. tamaño, extra queso).
+///   - Modifier: reglas (isRequired, minSelect, maxSelect).
+///   - Option: opciones con variación de precio (priceDelta).
+///   - Link: orden específico (position) por producto.
+///   Snapshot de nombres y precios se guarda en OrderItem/OrderItemModifier para historial inmutable.
+///
+/// ProductPrice:
+///   Lista de precios por sucursal con vigencia (startsAt / endsAt nullable).
+///   Permite historial de cambios y pricing futuro. Unique: (productId, branchId, startsAt).
+///
+/// -----------------------------------------------
+/// PROMOCIONES
+/// -----------------------------------------------
+/// Coupon:
+///   Cupón con descuento porcentual o monto fijo y condiciones (minSubtotal, vigencia).
+///   Asociado opcionalmente a un pedido (uno por pedido).
+///
+/// -----------------------------------------------
+/// VENTAS / PEDIDOS
+/// -----------------------------------------------
+/// Order:
+///   Núcleo transaccional.
+///   - number (BigInt) único para numeración secuencial externa.
+///   - channel y status con índices para filtros comunes.
+///   - Totales derivados: subtotal, discountTotal, taxTotal, total.
+///   - Relaciona: mesa, cliente, dirección, courier, mesero, cajero, cupón.
+///   - Soft delete para preservación de historial.
+///
+/// OrderStatusHistory:
+///   Auditoría de cambios de estado (fromStatus -> toStatus) con timestamp y usuario opcional.
+///
+/// OrderItem:
+///   Línea de producto con snapshot de nombre, impuestos y cálculos financieros (subtotal, descuento, impuesto, total).
+///
+/// OrderItemModifier:
+///   Adiciones/opciones seleccionadas por línea. Guarda snapshot independiente para consistencia histórica.
+///
+/// Payment:
+///   Pagos recibidos (parciales, múltiples métodos). Estado controla flujo de liquidación y reversos.
+///   Campo reference para tokens externos (POS, transacción bancaria).
+///
+/// Invoice / InvoiceLine:
+///   Documento fiscal emitido por pedido (1:1). Numeración única y líneas derivadas de los ítems (o tratadas por reglas fiscales).
+///
+/// -----------------------------------------------
+/// INVENTARIO
+/// -----------------------------------------------
+/// StockItem:
+///   Ítems inventariables por sucursal (materias primas u otros). Control de umbral (minStock).
+///
+/// ProductBOM:
+///   Receta: define cantidad (qtyPerUnit) de insumo por producto vendido (para costeo / decremento).
+///
+/// StockMovement:
+///   Registro de movimientos (entradas, salidas, ajustes) con razón y referencia (ej. pedido, compra, ajuste manual).
+///   Index por (branchId, stockItemId, movementDate) optimiza consultas cronológicas.
+///
+/// -----------------------------------------------
+/// CONSIDERACIONES DE DISEÑO
+/// -----------------------------------------------
+/// 1. Soft Delete:
+///    Campos deletedAt presentes en la mayoría de entidades maestras para preservación histórica sin cascadas destructivas.
+/// 2. Auditoría:
+///    - updatedAt se inicializa con now(); se recomienda middleware para auto-actualizar.
+///    - OrderStatusHistory y snapshots en líneas evitan discrepancias por cambios futuros en catálogo.
+/// 3. Escalabilidad:
+///    Índices en pedidos por estado y canal; puede ampliarse con fechas (createdAt) para reporting.
+/// 4. Precios:
+///    ProductPrice soporta múltiples períodos; para obtener precio vigente: filtrar por branchId, productId, startsAt <= now y (endsAt es null o endsAt > now) ordenado por startsAt desc.
+/// 5. Descuentos:
+///    - A nivel pedido: coupon + discountTotal.
+///    - A nivel línea: lineDiscount y priceDelta en modificadores.
+/// 6. Impuestos:
+///    taxPercent por producto y reflejado en líneas e invoiceLines para trazabilidad.
+/// 7. Integridad:
+///    Uso de onDelete:
+///      - Cascade en componentes que no deben quedar huérfanos (OrderItems, ComboComponents).
+///      - Restrict donde se requiere preservar historial (Product referenciado en OrderItem).
+///      - SetNull para relaciones operativas opcionales (mesero, courier, dirección).
+/// 8. Seguridad / Roles:
+///    Sistema RBAC flexible con tablas puente; escalable para ABAC si se agrega metadata externa.
+/// 9. Inventario:
+///    Simplificado; no hay stock actual calculado en tabla, se deriva sumando movimientos.
+/// 10. Extensibilidad:
+///     - Espacio para agregar: promociones avanzadas, bundles dinámicos, multi-impuesto, tracking de preparación.
+///
+/// -----------------------------------------------
+/// POSIBLES MEJORAS FUTURAS
+/// -----------------------------------------------
+/// - Agregar índice (branchId, createdAt) en orders para dashboards.
+/// - Tabla de secuencias para asegurar numeración continua multi-sucursal.
+/// - Campo cost en StockItem y Product para márgenes.
+/// - Tabla de PurchaseOrders y Supplier para abastecimiento.
+/// - Webhooks o eventos (event sourcing) para integraciones externas.
+/// - Campos JSON para metadatos flexibles (ej. restricciones nutricionales).
+///
+/// -----------------------------------------------
+/// NOTAS DE USO
+/// -----------------------------------------------
+/// - Mantener consistencia de updatedAt con hook/middleware de Prisma.
+/// - Implementar lógica de asignación de number secuencial con transacción.
+/// - Validar reglas de modificadores (minSelect/maxSelect) en la capa de servicio.
+/// - Calcular totales del pedido dentro de transacción para evitar desajustes.
+/// - Asegurar que los movimientos de inventario se disparen al confirmar/cerrar pedidos, no al crearlos en borrador.
+///
+/// Fin de la documentación resumida del esquema.
+
+// ===========================
+// GENERATOR & DATASOURCE
+// ===========================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+generator seed {
+  provider = "prisma-client-js"
+}
+
+generator ts {
+  provider = "ts-node"
+}
+
+// ===========================
+// ENUMS
+// ===========================
+enum service_channel {
+  UNSET // Canal de servicio no especificado
+  DINE_IN // Comedor
+  TAKEAWAY // Para llevar
+  DELIVERY // Entrega
+}
+
+enum order_status {
+  DRAFT // Borrador
+  CONFIRMED // Confirmado
+  IN_KITCHEN // En cocina
+  READY // Listo
+  DELIVERING // En entrega
+  COMPLETED // Completado
+  CANCELLED // Cancelado
+}
+
+enum payment_method {
+  CASH // Efectivo
+  CARD // Tarjeta
+  TRANSFER // Transferencia
+  MIXED // Mixto
+  OTHER // Otro
+}
+
+enum payment_status {
+  PENDING // Pendiente
+  PAID // Pagado
+  PARTIAL // Parcial
+  REFUNDED // Reembolsado
+  VOID // Anulado
+}
+
+// ===========================
+// CORE ENTITIES
+// ===========================
+
+/// Modelo Branch: Representa una sucursal (tienda física) del sistema de pizzas.
+/// 
+/// Campos básicos:
+/// - id: Identificador único UUID.
+/// - code: Código interno único de la sucursal (para referencias operativas).
+/// - name: Nombre descriptivo de la sucursal.
+/// - address: Dirección física (opcional).
+/// - phone: Teléfono de contacto (opcional).
+/// - city: Ciudad donde se ubica (opcional).
+/// - isActive: Indica si la sucursal está activa (por defecto true).
+/// - createdAt: Fecha/hora de creación del registro.
+/// - updatedAt: Fecha/hora de última actualización (gestionar manualmente si se requiere auto-update).
+/// - deletedAt: Marca de borrado lógico (null si no está eliminada).
+/// 
+/// Relaciones:
+/// - users: Usuarios asociados que operan en la sucursal.
+/// - diningTables: Mesas físicas para consumo en el lugar.
+/// - couriers: Repartidores asignados a la sucursal.
+/// - productPrices: Lista de precios específicos por producto en esta sucursal.
+/// - stockItems: Existencias (inventario) de la sucursal.
+/// - orders: Pedidos generados en esta sucursal.
+/// - stockMovements: Movimientos de inventario (entradas/salidas).
+/// 
+/// Notas:
+/// - Se usa borrado lógico mediante deletedAt.
+/// - Considera un trigger o middleware para mantener updatedAt sincronizado.
+/// - code debería ser corto y estable (ej. "SUC01") para integración externa.
+/// - isActive permite deshabilitar sin eliminar historial de datos.
+model Branch {
+  id        String    @id @default(uuid()) @map("id")
+  code      String    @unique @map("code")
+  name      String    @map("name")
+  address   String?   @map("address")
+  phone     String?   @map("phone")
+  city      String?   @map("city")
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  users          User[]
+  diningTables   DiningTable[]
+  couriers       Courier[]
+  productPrices  ProductPrice[]
+  stockItems     StockItem[]
+  orders         Order[]
+  stockMovements StockMovement[]
+
+  @@map("branches")
+}
+
+/// Modelo Role:
+/// Representa un rol dentro del sistema para control de acceso y autorización.
+///
+/// Campos principales:
+/// - id: Identificador único (UUID) generado automáticamente.
+/// - name: Nombre único del rol (e.g. "ADMIN", "USER") utilizado para comprobaciones de permisos.
+/// - description: Descripción opcional que detalla el propósito del rol.
+/// - createdAt: Fecha/hora de creación (se asigna automáticamente).
+/// - updatedAt: Fecha/hora de última actualización (inicialmente igual a createdAt; considerar middleware para mantenerla al día).
+/// - deletedAt: Marca opcional de borrado lógico (null = activo; no-null = "eliminado").
+///
+/// Relaciones:
+/// - userRoles: Asociación muchos-a-muchos con usuarios a través de la tabla intermedia UserRole.
+/// - rolePermissions: Asociación con los permisos asignados al rol, permitiendo definir capacidades específicas.
+///
+/// Notas de uso:
+/// - Utilizar name como clave semántica para lógica de autorización.
+/// - Implementar actualización automática de updatedAt mediante middleware de Prisma o lógica de servicio.
+/// - Para "borrado", preferir establecer deletedAt en lugar de eliminar físicamente (soft delete).
+/// - Asegurar índices adecuados sobre name y deletedAt si se filtra frecuentemente por estado y búsqueda de roles.
+///
+/// Buenas prácticas:
+/// - Mantener un conjunto controlado de roles base y evitar proliferación dinámica.
+/// - Documentar en un seed inicial los roles críticos (p.ej. SUPER_ADMIN, ADMIN, SUPPORT).
+/// - Sincronizar cambios de roles con el mapeo de permisos en rolePermissions.
+model Role {
+  id          String    @id @default(uuid()) @map("id")
+  name        String    @unique @map("name")
+  description String?   @map("description")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@map("roles")
+}
+
+/// Modelo Permission: Representa un permiso granular dentro del sistema de control de acceso.
+///
+/// Campos:
+/// - id: Identificador único (UUID) del permiso.
+/// - code: Código único y estable que identifica el permiso; usado en lógica de autorización y seeding.
+/// - description: Texto descriptivo opcional para documentación interna.
+/// - createdAt: Marca temporal de creación (asignada automáticamente).
+/// - updatedAt: Marca temporal de última actualización (requiere middleware o lógica para mantenerse al día).
+/// - deletedAt: Marca de borrado lógico; cuando no es nulo el permiso se considera inactivo.
+///
+/// Relaciones:
+/// - rolePermissions: Conexiones con RolePermission que asocian este permiso a roles.
+///
+/// Notas de uso:
+/// - Utilizar 'code' como referencia inmutable en comprobaciones de permisos en el código.
+/// - Implementar un middleware Prisma (o hook de servicio) para actualizar 'updatedAt'.
+/// - Preferir el borrado lógico (establecer deletedAt) para preservar historial y auditoría.
+/// - Evitar reutilizar códigos de permisos eliminados para no generar ambigüedades históricas.
+model Permission {
+  id          String    @id @default(uuid()) @map("id")
+  code        String    @unique @map("code")
+  description String?   @map("description")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+/// Modelo de relación que vincula Roles con Permisos (tabla: role_permissions).
+/// Cada registro representa la asignación de un Permission a un Role.
+/// 
+/// Campos:
+/// - roleId: Identificador del Role (FK a Role.id). onDelete: Restrict evita borrar roles con permisos asociados.
+/// - permissionId: Identificador del Permission (FK a Permission.id). onDelete: Restrict evita borrar permisos en uso.
+/// 
+/// Clave primaria compuesta:
+/// - [roleId, permissionId] asegura unicidad de la pareja Role-Permission (no se pueden duplicar asignaciones).
+/// 
+/// Relaciones:
+/// - role: Relación muchos-a-uno hacia Role.
+/// - permission: Relación muchos-a-uno hacia Permission.
+/// 
+/// Uso típico:
+/// - Insertar un registro para otorgar un permiso a un rol.
+/// - Eliminar el registro para revocar ese permiso del rol.
+/// 
+/// Consideraciones:
+/// - Con onDelete: Restrict, primero se deben eliminar las asignaciones antes de borrar el Role o Permission.
+/// - Para listar permisos de un rol: incluir rolePermissions -> permission.
+/// - Para listar roles que poseen un permiso: incluir rolePermissions -> role.
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Restrict)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// Modelo User: representa usuarios del sistema y su relación con sucursales, roles, pedidos, pagos y movimientos de stock.
+/// id: Identificador UUID primario.
+/// branchId: Referencia opcional a la sucursal (Branch) a la que pertenece el usuario; null si no está asignado.
+/// username: Nombre de usuario único para autenticación.
+/// fullName: Nombre completo del usuario.
+/// email: Correo electrónico único opcional.
+/// passwordHash: Hash seguro de la contraseña almacenada.
+/// isActive: Indica si el usuario está activo (true por defecto).
+/// createdAt: Fecha y hora de creación del registro.
+/// updatedAt: Fecha y hora de la última actualización del registro.
+/// deletedAt: Marca temporal de borrado lógico (soft delete); null si no se ha eliminado.
+/// Relaciones:
+/// - branch: Relación opcional many-to-one con Branch; al eliminar la sucursal se establece en null (SetNull).
+/// - userRoles: Lista de roles asignados (UserRole) para control de permisos.
+/// - ordersAsWaiter: Pedidos donde el usuario actúa como mesero (relación "OrderWaiter").
+/// - ordersAsCashier: Pedidos donde actúa como cajero (relación "OrderCashier").
+/// - statusChanges: Historial de cambios de estado de pedidos realizados por este usuario (OrderStatusHistory).
+/// - payments: Pagos creados por el usuario (PaymentCreatedBy).
+/// - stockMovements: Movimientos de inventario registrados por el usuario.
+/// Notas:
+/// - Utiliza soft delete mediante deletedAt.
+/// - Asegura unicidad en username y email (este último opcional).
+/// - Mantiene integridad referencial con Branch usando onDelete: SetNull para preservar historial.
+model User {
+  id           String    @id @default(uuid()) @map("id")
+  branchId     String?   @map("branch_id")
+  username     String    @unique @map("username")
+  fullName     String    @map("full_name")
+  email        String?   @unique @map("email")
+  passwordHash String    @map("password_hash")
+  isActive     Boolean   @default(true) @map("is_active")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @default(now()) @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  branch          Branch?              @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  userRoles       UserRole[]
+  ordersAsWaiter  Order[]              @relation("OrderWaiter")
+  ordersAsCashier Order[]              @relation("OrderCashier")
+  statusChanges   OrderStatusHistory[] @relation("OrderStatusChangedBy")
+  payments        Payment[]            @relation("PaymentCreatedBy")
+  stockMovements  StockMovement[]
+
+  @@map("users")
+}
+
+/// Modelo intermedio (tabla de unión) que representa la relación muchos-a-muchos entre usuarios y roles.
+/// - Clave primaria compuesta: (userId, roleId) garantiza que no se duplique la misma asignación.
+/// - Campo userId: referencia al identificador único de User; si el usuario se elimina, sus asignaciones se eliminan (onDelete: Cascade).
+/// - Campo roleId: referencia al identificador único de Role; la eliminación del rol se restringe si está asignado (onDelete: Restrict).
+/// - Relaciones:
+///   - user: vincula la fila con un registro existente en User.
+///   - role: vincula la fila con un registro existente en Role.
+/// - Mapeo de tabla: se almacena físicamente como "user_roles" en la base de datos.
+/// Uso típico: gestionar autorizaciones y comprobar qué roles posee un usuario sin duplicidades.
+model UserRole {
+  userId String @map("user_id")
+  roleId String @map("role_id")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+/// Modelo Customer:
+/// Representa a un cliente del sistema de pedidos de pizzas.
+/// Relaciona información de identificación, contacto, auditoría temporal y sus vínculos con direcciones y pedidos.
+///
+/// Campos:
+/// - id: Identificador único (UUID) generado automáticamente.
+/// - fullName: Nombre completo del cliente (obligatorio).
+/// - phone: Teléfono de contacto (opcional, único; múltiples NULL permitidos en Postgres).
+/// - email: Correo electrónico del cliente (opcional, único; múltiples NULL permitidos en Postgres).
+/// - createdAt: Fecha y hora de creación del registro (se asigna automáticamente).
+/// - updatedAt: Fecha y hora de la última actualización (valor inicial automático; requiere lógica adicional para mantenerse al día).
+/// - deletedAt: Marca temporal de borrado lógico (null si el registro está activo).
+///
+/// Relaciones:
+/// - addresses: Lista de direcciones asociadas al cliente (uno a muchos).
+/// - orders: Lista de pedidos realizados por el cliente (uno a muchos).
+///
+/// Notas de uso:
+/// - Considerar un middleware o hook de actualización para mantener updatedAt sincronizado.
+/// - deletedAt permite implementar soft delete; filtrar por registros donde deletedAt sea null para datos activos.
+/// - email y phone son únicos pero permiten múltiples NULL en Postgres.
+/// - Validar unicidad de email y/o phone a nivel de aplicación si se requieren restricciones adicionales.
+///
+/// Tabla subyacente: "customers" (mapeada mediante @@map).
+model Customer {
+  id        String    @id @default(uuid()) @map("id")
+  fullName  String    @map("full_name")
+  phone     String?   @unique @map("phone")
+  email     String?   @unique @map("email")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  addresses CustomerAddress[]
+  orders    Order[]
+
+  @@map("customers")
+}
+
+/// Modelo que representa una dirección física asociada a un cliente (Customer).
+/// Se utiliza para almacenar múltiples direcciones, permitiendo marcar una como predeterminada y
+/// soportando soft delete mediante el campo deletedAt.
+///
+/// Campos:
+/// - id: Identificador único UUID de la dirección.
+/// - customerId: Referencia al cliente propietario de la dirección.
+/// - label: Etiqueta opcional (ej: "Casa", "Trabajo") para facilitar identificación.
+/// - addressLine: Línea principal de la dirección (calle, número, etc.).
+/// - reference: Referencia opcional adicional (puntos de apoyo para el reparto).
+/// - city: Ciudad asociada a la dirección.
+/// - geolat: Latitud geográfica con precisión decimal (10,7) para geocodificación.
+/// - geolng: Longitud geográfica con precisión decimal (10,7) para geocodificación.
+/// - isDefault: Indica si esta dirección es la predeterminada del cliente.
+/// - createdAt: Marca de tiempo de creación del registro.
+/// - updatedAt: Marca de tiempo de la última actualización (debe actualizarse manualmente o vía middleware).
+/// - deletedAt: Fecha de eliminación lógica (null si el registro está activo).
+///
+/// Relaciones:
+/// - customer: Relación muchos-a-uno con Customer; eliminación en cascada.
+/// - orders: Pedidos asociados que utilizan esta dirección.
+///
+/// Notas de uso:
+/// - Asegurar que solo una dirección por cliente tenga isDefault = true (validación a nivel de aplicación o trigger).
+/// - Utilizar deletedAt para soft delete y conservar historial.
+/// - Actualizar updatedAt en operaciones de modificación (middleware Prisma o lógica de servicio).
+model CustomerAddress {
+  id          String    @id @default(uuid()) @map("id")
+  customerId  String    @map("customer_id")
+  label       String?   @map("label")
+  addressLine String    @map("address_line")
+  reference   String?   @map("reference")
+  city        String?   @map("city")
+  geolat      Decimal?  @map("geolat") @db.Decimal(10, 7)
+  geolng      Decimal?  @map("geolng") @db.Decimal(10, 7)
+  isDefault   Boolean   @default(false) @map("is_default")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  orders   Order[]
+
+  @@unique([customerId, label])
+  @@map("customer_addresses")
+}
+
+/// Modelo que representa una mesa de comedor (dining table) dentro de una sucursal.
+/// Garantiza unicidad del código de mesa por sucursal y soporta borrado lógico.
+/// Relaciones:
+/// - branch: referencia a la sucursal propietaria (onDelete: Cascade)
+/// - orders: pedidos asociados a la mesa
+/// Restricciones:
+/// - @@unique([branchId, code]) asegura que no se repita el código dentro de la misma sucursal.
+///
+/// id: Identificador único (UUID) de la mesa.
+/// branchId: Clave foránea que apunta a la sucursal (Branch).
+/// code: Código legible de la mesa (único por sucursal), usado en la operación diaria.
+/// capacity: Capacidad máxima de comensales; null si no se ha definido.
+/// isActive: Indica si la mesa está habilitada para asignaciones y nuevos pedidos.
+/// createdAt: Fecha y hora de creación del registro.
+/// updatedAt: Fecha y hora de la última actualización del registro.
+/// deletedAt: Marca de borrado lógico; null significa que la mesa sigue vigente.
+/// branch: Relación Many-to-One con Branch; al eliminar la sucursal, se eliminan en cascada sus mesas.
+/// orders: Colección de pedidos asociados a la mesa.
+model DiningTable {
+  id        String    @id @default(uuid()) @map("id")
+  branchId  String    @map("branch_id")
+  code      String    @map("code")
+  capacity  Int?      @map("capacity")
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  branch Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@unique([branchId, code])
+  @@map("dining_tables")
+}
+
+/// Modelo Courier: representa a un repartidor asociado a una sucursal (Branch) y a múltiples pedidos (Order).
+/// Uso típico: asignar pedidos a repartidores y gestionar su disponibilidad.
+/// Borrado lógico mediante deletedAt y eliminación en cascada cuando se elimina la sucursal.
+///
+/// id: Identificador único (UUID).
+/// branchId: Clave foránea de la sucursal a la que pertenece el repartidor.
+/// name: Nombre del repartidor (obligatorio).
+/// phone: Teléfono de contacto (opcional).
+/// vehicle: Tipo / descripción del vehículo (opcional; ej. "moto", "auto", "bicicleta").
+/// isActive: Indica si el repartidor está activo para asignaciones (true por defecto).
+/// createdAt: Marca temporal de creación (generada automáticamente).
+/// updatedAt: Marca temporal de última actualización (actualizar mediante middleware o lógica de servicio).
+/// deletedAt: Fecha de borrado lógico (null si no ha sido desactivado definitivamente).
+///
+/// Relaciones:
+/// branch: Relación muchos-a-uno con Branch (onDelete: Cascade).
+/// orders: Lista de pedidos asociados (uno-a-muchos).
+///
+/// Notas de implementación:
+/// - Considera un índice adicional sobre (branchId, isActive) para consultas frecuentes.
+/// - Para soft delete, filtra siempre por deletedAt = null en las consultas activas.
+/// - Actualiza updatedAt en cada modificación (middleware Prisma recomendado).
+model Courier {
+  id        String    @id @default(uuid()) @map("id")
+  branchId  String    @map("branch_id")
+  name      String    @map("name")
+  phone     String?   @map("phone")
+  vehicle   String?   @map("vehicle")
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  branch Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@unique([branchId, name])
+  @@map("couriers")
+}
+
+/// ===========================
+/// CATALOG
+/// ===========================
+
+/// Modelo Category: representa categorías jerárquicas para organizar productos.
+/// Campos:
+/// - id (String, UUID): Identificador único generado automáticamente.
+/// - parentId (String?, FK): Referencia opcional a la categoría padre (estructura en árbol).
+/// - name (String): Nombre visible de la categoría. Debe ser único dentro del mismo parentId.
+/// - position (Int): Orden de aparición (menor valor = aparece antes).
+/// - isActive (Boolean): Indica si la categoría está activa y debe mostrarse.
+/// - createdAt (DateTime): Fecha/hora de creación (asignada automáticamente).
+/// - updatedAt (DateTime): Fecha/hora de última actualización (asignada automáticamente).
+/// - deletedAt (DateTime?): Marca de borrado lógico (null = no eliminada).
+/// Relaciones:
+/// - parent: Referencia opcional a la categoría padre (self‑reference).
+/// - children: Subcategorías hijas asociadas.
+/// - products: Productos vinculados a esta categoría.
+/// Notas:
+/// - Borrado lógico mediante deletedAt para preservar historial.
+/// - Relación autorreferenciada nombrada "CategoryToParent".
+/// - position permite ordenamiento personalizado en listados.
+/// - isActive facilita activar/desactivar sin eliminar.
+model Category {
+  id        String    @id @default(uuid()) @map("id")
+  parentId  String?   @map("parent_id")
+  name      String    @map("name")
+  position  Int       @default(0) @map("position")
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  parent   Category?  @relation("CategoryToParent", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryToParent")
+  products Product[]
+
+  @@unique([parentId, name])
+  @@map("categories")
+}
+
+/// Modelo Product
+/// Representa un producto o combo disponible para la venta.
+/// Campos principales:
+/// - id: Identificador único UUID.
+/// - categoryId: Relación opcional a la categoría. Si se elimina la categoría, se establece en NULL.
+/// - sku: Código único de inventario. Puede ser nulo si aún no se asigna.
+/// - name: Nombre visible del producto. ()
+/// - description: Descripción opcional detallada.
+/// - basePrice: Precio base antes de impuestos y modificaciones. Decimal (12,2).
+/// - isCombo: Indica si el producto es un combo (true) o un ítem individual (false).
+/// - isActive: Control lógico para habilitar/deshabilitar el producto sin eliminarlo.
+/// - taxPercent: Porcentaje de impuesto aplicado. Decimal (5,2). Valor por defecto 15.00.
+/// - createdAt / updatedAt: Timestamps de creación y última actualización.
+/// - deletedAt: Marca de borrado lógico (soft delete) cuando no es NULL.
+///
+/// Relaciones:
+/// - category: Referencia opcional a Category (onDelete: SetNull).
+/// - comboComponents: Componentes (líneas) que conforman este producto cuando actúa como combo.
+/// - asComponent: Registros donde este producto participa como componente de otro combo.
+/// - modifierLinks: Asociación a modificadores configurables (toppings, extras, etc.).
+/// - prices: Estructura de precios adicionales (ej. por tamaño, canal, zona).
+/// - orderItems: Ítems de pedido que referencian este producto.
+/// - boms: Lista de materiales (BOM) vinculada para control de insumos.
+///
+/// Notas de uso:
+/// - Usar basePrice como precio bruto antes de aplicar reglas dinámicas.
+/// - Para combos, los precios efectivos pueden derivarse de la suma de componentes o un precio fijo.
+/// - Soft delete: filtrar siempre registros donde deletedAt sea NULL en consultas de catálogo.
+/// - Actualizar updatedAt mediante middleware al modificar registros.
+///
+/// Buenas prácticas:
+/// - Validar unicidad de SKU al asignarlo.
+/// - Evitar cambiar taxPercent retroactivamente; usar versiones si la lógica fiscal lo requiere.
+/// - Separar lógica de cálculo de precio final (precio + modificadores + impuestos) en la capa de servicio.
+///
+/// Índices y rendimiento:
+/// - sku ya es único. Considerar índice adicional por (isActive, categoryId) para catálogos.
+/// - Si se consultan combos frecuentemente, optimizar con include selectivo de comboComponents.
+///
+/// Seguridad / Integridad:
+/// - Proteger operaciones de borrado físico; preferir soft delete.
+/// - Asegurar que un producto marcado como isCombo tenga al menos un comboComponent antes de activarlo.
+model Product {
+  id          String    @id @default(uuid()) @map("id")
+  categoryId  String?   @map("category_id")
+  sku         String?   @unique @map("sku")
+  name        String    @map("name")
+  description String?   @map("description")
+  basePrice   Decimal   @default(0) @map("base_price") @db.Decimal(12, 2)
+  isCombo     Boolean   @default(false) @map("is_combo")
+  isActive    Boolean   @default(true) @map("is_active")
+  taxPercent  Decimal   @default(15.00) @map("tax_percent") @db.Decimal(5, 2)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  category        Category?               @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  comboComponents ProductComboComponent[] @relation("ComboComponents_combo")
+  asComponent     ProductComboComponent[] @relation("ComboComponents_component")
+  modifierLinks   ProductModifierLink[]
+  prices          ProductPrice[]
+  orderItems      OrderItem[]
+  boms            ProductBOM[]
+
+  @@map("products")
+}
+
+/// Modelo que representa la relación de componentes dentro de un combo (producto compuesto).
+/// Cada registro asocia un producto "combo" con un producto "componente"
+/// y la cantidad necesaria de ese componente dentro del combo.
+///
+/// Clave primaria compuesta:
+/// - comboId + componentId garantizan que no se repita el mismo componente en el mismo combo.
+///
+/// Campos:
+/// - comboId: Identificador del producto que actúa como combo (producto agrupador).
+/// - componentId: Identificador del producto que actúa como componente dentro del combo.
+/// - qty: Cantidad (Decimal con precisión 10,3) requerida de este componente (por defecto 1).
+///
+/// Relaciones:
+/// - combo: Relación many-to-one hacia Product (el producto que representa el combo).
+///          onDelete: Cascade -> Si se elimina el combo, se eliminan sus componentes asociados.
+/// - component: Relación many-to-one hacia Product (el producto que actúa como componente).
+///              onDelete: Restrict -> Impide eliminar el producto componente si está referenciado.
+///
+/// Tabla subyacente:
+/// - Mapeada a "product_combo_components".
+///
+/// Uso típico:
+/// - Permite definir recetas, combos, packs o configuraciones de productos compuestos.
+/// - Facilita cálculos de inventario y descomposición de combos.
+///
+/// Notas:
+/// - Asegúrate de validar que combo y component no sean el mismo producto para evitar autorreferencias.
+/// - qty > 0: Recomendada validación a nivel de lógica de negocio.
+/// - Puede ampliarse con campos como "optional", "position", o "priceAdjustment" según necesidades futuras.
+model ProductComboComponent {
+  comboId     String  @map("combo_id")
+  componentId String  @map("component_id")
+  qty         Decimal @default(1) @map("qty") @db.Decimal(10, 3)
+
+  combo     Product @relation("ComboComponents_combo", fields: [comboId], references: [id], onDelete: Cascade)
+  component Product @relation("ComboComponents_component", fields: [componentId], references: [id], onDelete: Restrict)
+
+  @@id([comboId, componentId])
+  @@map("product_combo_components")
+}
+
+/// Representa un conjunto global de modificadores (grupo de opciones) que se pueden aplicar a uno o varios productos.
+/// El nombre debe ser único a nivel global para evitar duplicados como "Tamaño" o "Masa".
+/// Permite definir si la selección es obligatoria y los límites mínimo/máximo de opciones elegibles.
+/// También mantiene relaciones con sus opciones, con los productos a los que aplica y con modificadores seleccionados en ítems de pedido.
+///
+/// id: Identificador único UUID del modificador.
+/// name: Nombre global único del grupo de modificadores (ej: "Tamaño", "Tipo de masa").
+/// isRequired: Indica si el cliente debe seleccionar al menos una opción (true = obligatorio).
+/// minSelect: Cantidad mínima de opciones que el cliente debe elegir (0 si no es obligatorio).
+/// maxSelect: Cantidad máxima de opciones permitidas (null = sin límite explícito).
+/// createdAt: Fecha/hora de creación del registro.
+/// updatedAt: Fecha/hora de última actualización.
+/// deletedAt: Marca de borrado lógico (null si está activo).
+/// options: Lista de opciones individuales disponibles dentro de este modificador.
+/// products: Relación de enlaces que asocian este modificador a productos específicos.
+/// orderItemModifiers: Relación con los modificadores elegidos en los ítems de pedidos (histórico de uso).
+model ProductModifier {
+  id         String    @id @default(uuid()) @map("id")
+  name       String    @unique @map("name") // Único globalmente para evitar duplicados como "Tamaño"
+  isRequired Boolean   @default(false) @map("is_required")
+  minSelect  Int       @default(0) @map("min_select")
+  maxSelect  Int?      @map("max_select")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @default(now()) @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  options            ProductModifierOption[]
+  products           ProductModifierLink[]
+  orderItemModifiers OrderItemModifier[]
+
+  @@map("product_modifiers")
+}
+
+/// Representa una opción disponible dentro de un modificador de producto (por ejemplo: tamaño grande, extra queso).
+/// Cada opción puede alterar el precio base del producto mediante `priceDelta`.
+/// 
+/// Campos:
+/// - id: Identificador único (UUID) de la opción.
+/// - modifierId: Relación hacia el modificador padre al que pertenece esta opción.
+/// - name: Nombre visible de la opción.
+/// - priceDelta: Variación de precio que se suma (o resta si es negativa) al precio del producto. Precisión 12,2.
+/// - position: Orden numérico para mostrar las opciones de forma consistente en interfaces.
+/// - isActive: Indica si la opción está habilitada para selección.
+/// - createdAt: Fecha y hora de creación.
+/// - updatedAt: Fecha y hora de la última actualización (debe mantenerse sincronizada manualmente al actualizar registros).
+/// - deletedAt: Marca de borrado lógico (null si la opción sigue vigente).
+///
+/// Relaciones:
+/// - modifier: Referencia al modificador (ProductModifier) que agrupa esta opción. Eliminación en cascada.
+/// - itemModifiers: Conjunto de asociaciones a modificadores elegidos en ítems de pedido (OrderItemModifier).
+///
+/// Notas de uso:
+/// - Utilizar `isActive = false` o `deletedAt` para descontinuar opciones sin perder historial.
+/// - `position` permite reordenar sin depender de la creación cronológica.
+/// - Asegurar actualización de `updatedAt` mediante middleware o lógica de servicio.
+/// - Validar que `priceDelta` no viole reglas comerciales (por ejemplo, límites máximos configurados).
+/// - El nombre de la opción debe ser único dentro del mismo modificador.
+model ProductModifierOption {
+  id         String    @id @default(uuid()) @map("id")
+  modifierId String    @map("modifier_id")
+  name       String    @map("name")
+  priceDelta Decimal   @default(0) @map("price_delta") @db.Decimal(12, 2)
+  position   Int       @default(0) @map("position")
+  isActive   Boolean   @default(true) @map("is_active")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @default(now()) @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  modifier      ProductModifier     @relation(fields: [modifierId], references: [id], onDelete: Cascade)
+  itemModifiers OrderItemModifier[]
+
+  @@unique([modifierId, name])
+  @@map("product_modifier_options")
+}
+
+/// Modelo intermedio que representa la relación muchos-a-muchos entre Product y ProductModifier.
+/// Clave primaria compuesta: (productId, modifierId).
+/// Reglas de borrado: al eliminar un Product se eliminan sus vínculos (Cascade); no se permite
+/// eliminar un ProductModifier si está referenciado (Restrict).
+/// position permite definir el orden de presentación de los modificadores para cada producto.
+/// Campos:
+/// - productId: ID del producto (FK -> Product.id)
+/// - modifierId: ID del modificador (FK -> ProductModifier.id)
+/// - position: orden relativo del modificador dentro del producto (default 0)
+model ProductModifierLink {
+  productId  String @map("product_id")
+  modifierId String @map("modifier_id")
+  position   Int    @default(0) @map("position")
+
+  product  Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  modifier ProductModifier @relation(fields: [modifierId], references: [id], onDelete: Restrict)
+
+  @@id([productId, modifierId])
+  @@map("product_modifier_links")
+}
+
+/// Modelo que representa el historial de precios de un producto en una sucursal (branch).
+/// Mantiene múltiples registros para permitir cambios de precio en el tiempo sin perder trazabilidad.
+///
+/// Campos:
+/// - id: Identificador único (UUID).
+/// - productId: Referencia al producto asociado.
+/// - branchId: Referencia a la sucursal donde aplica el precio.
+/// - price: Precio vigente con precisión decimal (12,2).
+/// - startsAt: Fecha/hora desde la cual el precio entra en vigencia. Clave para versionado.
+/// - endsAt: Fecha/hora opcional que marca el fin de vigencia del precio (null = vigente).
+/// - createdAt / updatedAt: Marcas de auditoría para creación y última actualización.
+/// - deletedAt: Marca de borrado lógico (soft delete), null si el registro está activo.
+///
+/// Relaciones:
+/// - product: Relación muchos-a-uno con Product. Cascada en borrado.
+/// - branch: Relación muchos-a-uno con Branch. Cascada en borrado.
+///
+/// Restricciones:
+/// - @@unique([productId, branchId, startsAt]): Garantiza que no existan dos precios
+///   con la misma combinación de producto, sucursal e inicio de vigencia.
+/// - Uso de endsAt permite consultas de precio actual filtrando por NOW() entre startsAt y endsAt (o endsAt null).
+///
+/// Notas de uso:
+/// - Para obtener el precio vigente: filtrar por productId, branchId, startsAt <= ahora,
+///   endsAt es null o endsAt > ahora, ordenando por startsAt DESC y tomando el primero.
+/// - Al actualizar el precio sin perder histórico: establecer endsAt del registro vigente
+///   y crear uno nuevo con startsAt = ahora.
+/// - Soft delete: establecer deletedAt; considerar excluir estos registros en consultas operativas.
+///
+/// Consideraciones de integridad:
+/// - La precisión Decimal(12,2) soporta valores hasta 9.999.999.999,99 (dependiendo del proveedor).
+/// - startsAt y endsAt permiten manejar precios futuros programados.
+/// - Asegurar índices adicionales (si el motor lo requiere) sobre (productId, branchId, endsAt) para consultas rápidas.
+///
+/// Buenas prácticas:
+/// - Evitar superposición de rangos de vigencia manualmente.
+/// - Validar que startsAt < endsAt cuando endsAt no sea null.
+/// - Usar transacciones al cerrar un precio antiguo y abrir uno nuevo.
+model ProductPrice {
+  id        String    @id @default(uuid()) @map("id")
+  productId String    @map("product_id")
+  branchId  String    @map("branch_id")
+  price     Decimal   @map("price") @db.Decimal(12, 2)
+  startsAt  DateTime  @default(now()) @map("starts_at")
+  endsAt    DateTime? @map("ends_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, branchId, startsAt])
+  @@map("product_prices")
+}
+
+// ===========================
+// PROMOTIONS / COUPONS
+// ===========================
+
+/// Modelo Coupon:
+/// Representa un cupón promocional que puede aplicarse a pedidos para ofrecer descuentos porcentuales o fijos.
+///
+/// Campos:
+/// - id: Identificador único (UUID) generado automáticamente.
+/// - code: Código único del cupón (clave pública que el cliente ingresa).
+/// - description: Descripción opcional para contexto interno o visualización.
+/// - percentOff: Descuento porcentual (ej. 10.00 = 10%). Mutuamente excluyente lógica con amountOff (solo uno debería usarse).
+/// - amountOff: Descuento fijo en valor monetario. Mutuamente excluyente lógica con percentOff.
+/// - minSubtotal: Subtotal mínimo requerido para que el cupón sea válido.
+/// - startsAt: Fecha/hora desde la cual el cupón se considera válido (por defecto ahora).
+/// - endsAt: Fecha/hora opcional de expiración; null implica vigencia abierta hasta desactivación.
+/// - isActive: Bandera rápida para activar/desactivar sin borrar el cupón.
+/// - createdAt: Marca temporal de creación.
+/// - updatedAt: Marca temporal de última actualización (debe mantenerse sincronizada manualmente con middleware o lógica de servicio).
+/// - deletedAt: Marca temporal para borrado lógico (soft delete); null = no eliminado.
+/// - orders: Relación con pedidos que han utilizado este cupón.
+///
+/// Notas de uso y buenas prácticas:
+/// - Validar que no se usen simultáneamente percentOff y amountOff; definir una regla de negocio clara.
+/// - Asegurar que endsAt > startsAt cuando endsAt no sea null.
+/// - Al aplicar el cupón verificar:
+///   * isActive == true
+///   * deletedAt == null
+///   * startsAt <= ahora < endsAt (si endsAt no es null)
+///   * subtotal >= minSubtotal (si minSubtotal no es null)
+/// - Mantener índice único en code para evitar duplicados.
+/// - Considerar normalizar code (mayúsculas, trim) antes de guardar.
+/// - Para updatedAt usar un middleware de Prisma (p.ej. before update) que refresque el timestamp.
+/// - Soft delete: filtrar siempre deletedAt == null en consultas públicas.
+///
+/// Escenarios comunes:
+/// - Cupón porcentual: percentOff se establece, amountOff = null.
+/// - Cupón monto fijo: amountOff se establece, percentOff = null.
+/// - Cupón ilimitado temporalmente: endsAt = null.
+/// - Desactivación temporal: isActive = false sin cambiar fechas.
+///
+/// Seguridad:
+/// - No exponer internamente cupones inactivos o eliminados en endpoints de listado público.
+/// - Registrar auditoría al canjear para evitar reutilización indebida según política del negocio.
+///
+/// Internacionalización:
+/// - description puede soportar varios idiomas via otra tabla si se requiere escalabilidad.
+///
+/// Rendimiento:
+/// - Considerar índice adicional sobre (is_active, starts_at, ends_at) si se filtra frecuentemente por vigencia.
+model Coupon {
+  id          String    @id @default(uuid()) @map("id")
+  code        String    @unique @map("code")
+  description String?   @map("description")
+  percentOff  Decimal?  @map("percent_off") @db.Decimal(5, 2)
+  amountOff   Decimal?  @map("amount_off") @db.Decimal(12, 2)
+  minSubtotal Decimal?  @map("min_subtotal") @db.Decimal(12, 2)
+  startsAt    DateTime  @default(now()) @map("starts_at")
+  endsAt      DateTime? @map("ends_at")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  orders Order[]
+
+  @@map("coupons")
+}
+
+// ===========================
+// SALES
+// ===========================
+
+/// Modelo Order
+/// Representa una orden de venta creada en una sucursal (branch). Contiene
+/// información sobre su estado, canal de origen, montos monetarios, relaciones
+/// con cliente, mesa, personal y pagos asociados.
+///
+/// Campos principales (persistencia):
+/// - id: Identificador único UUID de la orden.
+/// - branchId: Referencia obligatoria a la sucursal donde se originó la orden.
+/// - number: Número secuencial (BigInt) opcional; suele asignarse al confirmar/finalizar.
+/// - status: Estado actual del flujo de la orden (enum order_status). Por defecto DRAFT.
+/// - channel: Canal o fuente del pedido (enum service_channel), ej. DELIVERY, DINE_IN, TAKE_AWAY. Por defecto UNSET.
+/// - diningTableId: Relación opcional a la mesa (para consumo en salón).
+/// - customerId: Cliente asociado (opcional). Puede ser nulo para ventas rápidas.
+/// - customerAddressId: Dirección específica del cliente (opcional, típica de delivery).
+/// - courierId: Repartidor asignado (opcional) para pedidos de entrega.
+/// - waiterId: Mesero asignado (opcional) para pedidos en salón.
+/// - cashierId: Cajero que procesó/cerró la orden (opcional).
+/// - couponId: Cupón aplicado (opcional) para descuentos promocionales.
+/// - notes: Observaciones libres del pedido (ej. instrucciones especiales).
+///
+/// Totales monetarios (Decimal 12,2):
+/// - subtotal: Suma de los precios de los ítems antes de descuentos e impuestos.
+/// - discountTotal: Total de descuentos aplicados (cupones, promociones, líneas).
+/// - taxTotal: Total de impuestos calculados sobre la base imponible.
+/// - total: Importe final a pagar (subtotal - discountTotal + taxTotal).
+///
+/// Tiempos:
+/// - createdAt: Fecha/hora de creación.
+/// - updatedAt: Fecha/hora de última actualización (debe ajustarse vía lógica de aplicación).
+/// - deletedAt: Marca de borrado lógico (soft delete) si se establece.
+///
+/// Relaciones:
+/// - branch: Sucursal propietaria (obligatoria). onDelete: Restrict (impide borrar sucursal con órdenes activas).
+/// - diningTable: Mesa asociada. onDelete: SetNull.
+/// - customer: Cliente dueño de la orden. onDelete: SetNull.
+/// - customerAddress: Dirección usada para entrega. onDelete: SetNull.
+/// - courier: Repartidor asignado. onDelete: SetNull.
+/// - waiter: Usuario (rol mesero) asignado mediante relación nombrada "OrderWaiter".
+/// - cashier: Usuario (rol cajero) asignado mediante relación "OrderCashier".
+/// - coupon: Cupón aplicado. onDelete: SetNull.
+/// - statusHistory: Historial de cambios de estado (1:N).
+/// - items: Líneas de detalle (productos, cantidades, precios).
+/// - payments: Pagos registrados (puede haber múltiples métodos).
+/// - invoice: Factura asociada (1:1) si se emitió.
+///
+/// Comportamiento y consideraciones:
+/// - El número (number) puede diferirse hasta confirmación para permitir borradores.
+/// - Desnormalizar subtotales y totales ayuda a consultas rápidas; recalcular en cambios de items.
+/// - discountTotal + taxTotal deben mantener coherencia con las líneas y reglas fiscales vigentes.
+/// - Soft delete (deletedAt) permite conservar integridad histórica sin eliminar físicamente.
+/// - Actualizar updatedAt manualmente (Prisma no lo hace automáticamente sin middleware).
+///
+/// Índices:
+/// - (branchId, status): Optimiza consultas por estado dentro de una sucursal (ej. listar órdenes abiertas).
+/// - (channel): Filtra por canal operativo (análisis de origen de pedidos).
+///
+/// Buenas prácticas:
+/// - Encapsular lógica de transición de status con validaciones (FSM ligera).
+/// - Asegurar atomicidad al confirmar: asignar number, recalcular totales, generar statusHistory.
+/// - Validar que waiterId sólo se use cuando channel corresponda (ej. DINE_IN).
+/// - Sincronizar taxTotal acorde a configuración fiscal y localización de branch/customerAddress.
+/// - Usar transacciones para crear orden + items + pagos iniciales.
+/// - Proteger cambios de totales una vez la orden esté cerrada/facturada.
+///
+/// Seguridad y auditoría:
+/// - statusHistory complementa la trazabilidad (quién/cuándo cambió estado).
+/// - cashierId y waiterId ayudan a auditoría de procesos internos.
+///
+/// Extensibilidad:
+/// - Se puede añadir prop para propinas (tips) o cargos de servicio.
+/// - Añadir relación a una tabla de fulfillment/logística avanzada si escala el delivery.
+///
+/// Notas de eliminación:
+/// - onDelete SetNull en relaciones opcionales evita cascadas no deseadas y preserva la orden histórica.
+/// - Considerar tarea de limpieza para órdenes DRAFT antiguas con deletedAt nulo.
+///
+/// Localización:
+/// - Montos utilizan Decimal(12,2); ajustar si se requieren más dígitos o multi-moneda (añadiendo currencyCode).
+model Order {
+  id                String          @id @default(uuid()) @map("id")
+  branchId          String          @map("branch_id")
+  number            BigInt?         @unique @map("number") @db.BigInt
+  status            order_status    @default(DRAFT) @map("status")
+  channel           service_channel @default(UNSET) @map("channel")
+  diningTableId     String?         @map("dining_table_id")
+  customerId        String?         @map("customer_id")
+  customerAddressId String?         @map("customer_address_id")
+  courierId         String?         @map("courier_id")
+  waiterId          String?         @map("waiter_id")
+  cashierId         String?         @map("cashier_id")
+  couponId          String?         @map("coupon_id")
+  notes             String?         @map("notes")
+  subtotal          Decimal         @default(0) @map("subtotal") @db.Decimal(12, 2)
+  discountTotal     Decimal         @default(0) @map("discount_total") @db.Decimal(12, 2)
+  taxTotal          Decimal         @default(0) @map("tax_total") @db.Decimal(12, 2)
+  total             Decimal         @default(0) @map("total") @db.Decimal(12, 2)
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @default(now()) @map("updated_at")
+  deletedAt         DateTime?       @map("deleted_at")
+
+  branch          Branch           @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  diningTable     DiningTable?     @relation(fields: [diningTableId], references: [id], onDelete: SetNull)
+  customer        Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerAddress CustomerAddress? @relation(fields: [customerAddressId], references: [id], onDelete: SetNull)
+  courier         Courier?         @relation(fields: [courierId], references: [id], onDelete: SetNull)
+  waiter          User?            @relation("OrderWaiter", fields: [waiterId], references: [id], onDelete: SetNull)
+  cashier         User?            @relation("OrderCashier", fields: [cashierId], references: [id], onDelete: SetNull)
+  coupon          Coupon?          @relation(fields: [couponId], references: [id], onDelete: SetNull)
+
+  statusHistory OrderStatusHistory[]
+  items         OrderItem[]
+  payments      Payment[]
+  invoice       Invoice?
+
+  @@index([branchId, status], map: "orders_branch_status_idx")
+  @@index([channel], map: "orders_channel_idx")
+  @@map("orders")
+}
+
+/// Historial de cambios de estado de una orden.
+/// Cada registro captura la transición entre estados, quién realizó el cambio
+/// y el momento exacto en que ocurrió.
+///
+/// Campos:
+/// - id: Identificador único (UUID) del registro del historial.
+/// - orderId: Referencia a la orden cuyo estado cambió.
+/// - fromStatus: Estado anterior de la orden (puede ser nulo si es el primer estado registrado).
+/// - toStatus: Nuevo estado asignado a la orden.
+/// - changedBy: Usuario que efectuó el cambio (nulo si fue un proceso automático o del sistema).
+/// - changedAt: Marca de tiempo en la que se registró el cambio.
+///
+/// Relaciones:
+/// - order: Relación obligatoria con la entidad Order; al eliminar la orden se elimina su historial (Cascade).
+/// - user: Relación opcional con la entidad User que indica quién cambió el estado; al eliminar el usuario se establece en NULL (SetNull).
+///
+/// Índices:
+/// - (orderId, changedAt): Optimiza consultas cronológicas del historial por orden.
+///
+/// Uso típico:
+/// - Auditoría del flujo de estados de una orden.
+/// - Visualización de la línea de tiempo de cambios.
+/// - Métricas y analíticas de tiempos entre transiciones.
+///
+/// Notas:
+/// - Solo se insertan nuevos registros; no se actualizan los anteriores (inmutabilidad del historial).
+/// - fromStatus puede ser null para el primer estado.
+/// - Permite reconstruir el ciclo de vida completo de la orden y detectar cuellos de botella.
+model OrderStatusHistory {
+  id         String        @id @default(uuid()) @map("id")
+  orderId    String        @map("order_id")
+  fromStatus order_status? @map("from_status")
+  toStatus   order_status  @map("to_status")
+  changedBy  String?       @map("changed_by")
+  changedAt  DateTime      @default(now()) @map("changed_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user  User? @relation("OrderStatusChangedBy", fields: [changedBy], references: [id], onDelete: SetNull)
+
+  @@index([orderId, changedAt])
+  @@map("order_status_history")
+}
+
+/// Modelo OrderItem:
+/// Representa una línea (producto/modificador) dentro de un pedido.
+/// Contiene una instantánea del nombre del producto, cantidades,
+/// precios unitarios, impuestos y totales calculados.
+///
+/// Campos:
+/// - id: Identificador único UUID del ítem.
+/// - orderId: Identificador del pedido al que pertenece.
+/// - productId: Identificador del producto original (referencia a Product).
+/// - nameSnapshot: Nombre capturado del producto al momento de crear la línea (evita cambios retroactivos).
+/// - taxPercent: Porcentaje de impuesto aplicado (ej. IVA) con precisión (5,2).
+/// - qty: Cantidad solicitada (permite fracciones, p.ej. 1.500) con precisión (10,3).
+/// - unitPrice: Precio unitario antes de impuestos y descuentos (12,2).
+/// - lineSubtotal: Subtotal bruto (qty * unitPrice) antes de descuentos e impuestos.
+/// - lineDiscount: Descuento total aplicado a esta línea.
+/// - lineTax: Importe de impuestos calculado sobre la base imponible (subtotal - descuento).
+/// - lineTotal: Total final de la línea (subtotal - descuento + impuesto).
+/// - position: Orden de aparición dentro del pedido (para ordenamiento estable).
+/// - createdAt: Fecha/hora de creación.
+/// - updatedAt: Fecha/hora de última actualización.
+///
+/// Relaciones:
+/// - order: Relación muchos-a-uno con Order (eliminar en cascada).
+/// - product: Relación muchos-a-uno con Product (restricción al eliminar para preservar integridad).
+/// - modifiers: Lista de modificadores asociados (ingredientes extra, variaciones, etc.).
+///
+/// Índices:
+/// - orderId: Optimiza consultas por los ítems de un pedido.
+///
+/// Notas de diseño:
+/// - Los totales (subtotal, descuento, impuesto, total) se almacenan para evitar recalcular y
+///   preservar la información histórica incluso si cambian reglas fiscales o precios.
+/// - Se usa snapshot del nombre para mantener coherencia histórica ante cambios de catálogo.
+/// - Decimal se utiliza para evitar errores de redondeo en cálculos monetarios.
+/// - position permite reordenar sin depender de createdAt.
+///
+/// Estrategia recomendada de cálculo (ejemplo):
+///   lineSubtotal = qty * unitPrice
+///   baseImponible = lineSubtotal - lineDiscount
+///   lineTax = round(baseImponible * (taxPercent / 100), 2)
+///   lineTotal = baseImponible + lineTax
+///
+/// Validaciones sugeridas (a nivel de aplicación):
+/// - qty > 0
+/// - taxPercent >= 0
+/// - lineDiscount >= 0 y no exceda lineSubtotal
+/// - Recalcular y sincronizar lineSubtotal / lineTax / lineTotal en actualizaciones.
+///
+/// Consideraciones de concurrencia:
+/// - Usar transacciones al insertar múltiples OrderItem y sus modifiers para mantener consistencia.
+/// - Si se recalculan totales del pedido, hacerlo dentro de la misma transacción.
+///
+/// Internacionalización:
+/// - nameSnapshot permite almacenar el nombre específico en el idioma mostrado al cliente.
+///
+/// Mantenimiento:
+/// - Actualizar updatedAt en cada modificación.
+/// - Evitar modificar fields calculados manualmente fuera de la lógica central de facturación.
+model OrderItem {
+  id           String   @id @default(uuid()) @map("id")
+  orderId      String   @map("order_id")
+  productId    String   @map("product_id")
+  nameSnapshot String   @map("name_snapshot")
+  taxPercent   Decimal  @map("tax_percent") @db.Decimal(5, 2)
+  qty          Decimal  @map("qty") @db.Decimal(10, 3)
+  unitPrice    Decimal  @map("unit_price") @db.Decimal(12, 2)
+  lineSubtotal Decimal  @default(0) @map("line_subtotal") @db.Decimal(12, 2)
+  lineDiscount Decimal  @default(0) @map("line_discount") @db.Decimal(12, 2)
+  lineTax      Decimal  @default(0) @map("line_tax") @db.Decimal(12, 2)
+  lineTotal    Decimal  @default(0) @map("line_total") @db.Decimal(12, 2)
+  position     Int      @default(0) @map("position")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @map("updated_at")
+
+  order     Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  modifiers OrderItemModifier[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+/// Modelo que representa un modificador (y opcionalmente su opción concreta) aplicado a un ítem de pedido.
+/// Se usa para “congelar” (snapshot) el nombre y el impacto en el precio al momento de crear el pedido,
+/// evitando que cambios posteriores en el catálogo afecten pedidos históricos.
+///
+/// Campos:
+/// - id: Identificador único (UUID).
+/// - orderItemId: Referencia obligatoria al OrderItem al que pertenece este modificador.
+/// - modifierId: Referencia opcional al ProductModifier (puede ser nulo si solo se conserva la instantánea del nombre).
+/// - optionId: Referencia opcional a la opción específica (ProductModifierOption) elegida, si aplica.
+/// - nameSnapshot: Nombre del modificador u opción en el momento del pedido (texto inmutable para historial).
+/// - priceDelta: Diferencia de precio que este modificador aporta al ítem (puede ser 0, positiva o negativa).
+/// - position: Orden relativo para presentar los modificadores dentro del ítem (permite ordenamiento estable).
+///
+/// Relaciones:
+/// - orderItem: Relación padre; al eliminar el OrderItem se eliminan en cascada sus modificadores (onDelete: Cascade).
+/// - modifier: Relación opcional; si el modificador original se elimina, este campo pasa a null (SetNull).
+/// - option: Relación opcional con la opción concreta; también se vuelve null si la opción se elimina (SetNull).
+///
+/// Índices:
+/// - orderItemId: Index para acelerar búsquedas de modificadores por ítem de pedido.
+///
+/// Notas de diseño:
+/// - nameSnapshot y priceDelta permiten auditoría y facturación confiable frente a cambios de catálogo.
+/// - Usar position para mantener el orden de selección del cliente o un orden lógico definido.
+/// - priceDelta con precisión (12,2) evita pérdida de exactitud en montos monetarios.
+/// - modifierId y optionId son opcionales para soportar casos donde solo se preserva el texto histórico.
+///
+/// Buenas prácticas:
+/// - Al crear un OrderItemModifier siempre copiar el nombre actual del modificador/opción a nameSnapshot.
+/// - No actualizar nameSnapshot ni priceDelta después de confirmado el pedido (inmutabilidad histórica).
+/// - Validar coherencia: si optionId está presente, normalmente modifierId también debería estarlo.
+model OrderItemModifier {
+  id           String  @id @default(uuid()) @map("id")
+  orderItemId  String  @map("order_item_id")
+  modifierId   String? @map("modifier_id")
+  optionId     String? @map("option_id")
+  nameSnapshot String  @map("name_snapshot")
+  priceDelta   Decimal @default(0) @map("price_delta") @db.Decimal(12, 2)
+  position     Int     @default(0) @map("position")
+
+  orderItem OrderItem              @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  modifier  ProductModifier?       @relation(fields: [modifierId], references: [id], onDelete: SetNull)
+  option    ProductModifierOption? @relation(fields: [optionId], references: [id], onDelete: SetNull)
+
+  @@index([orderItemId])
+  @@map("order_item_modifiers")
+}
+
+/// Modelo Payment:
+/// Representa un registro de pago asociado a un pedido.
+/// Incluye información sobre método, estado, monto, referencia y trazabilidad temporal.
+/// Relaciones:
+/// - order: Pedido al que pertenece el pago (obligatorio).
+/// - user: Usuario que creó el registro del pago (opcional).
+///
+/// Campos:
+/// - id: Identificador único (UUID) del pago.
+/// - orderId: Referencia al pedido relacionado.
+/// - method: Método de pago utilizado (enum payment_method).
+/// - status: Estado del pago (enum payment_status) con valor inicial PENDING.
+/// - amount: Monto del pago con precisión decimal (hasta 12 dígitos, 2 decimales).
+/// - reference: Código o referencia externa del pago (opcional).
+/// - paidAt: Fecha y hora en que se confirmó el pago (opcional).
+/// - createdBy: Identificador del usuario que registró el pago (opcional).
+/// - createdAt: Marca de tiempo de creación del registro.
+/// - updatedAt: Marca de tiempo de última actualización.
+/// Índices:
+/// - Índice por orderId para optimizar consultas por pedido.
+/// Reglas de borrado:
+/// - Al eliminar un pedido, sus pagos asociados se eliminan en cascada.
+/// - Si se elimina el usuario creador, el campo createdBy pasa a null.
+model Payment {
+  id        String         @id @default(uuid()) @map("id")
+  orderId   String         @map("order_id")
+  method    payment_method @map("method")
+  status    payment_status @default(PENDING) @map("status")
+  amount    Decimal        @map("amount") @db.Decimal(12, 2)
+  reference String?        @map("reference")
+  paidAt    DateTime?      @map("paid_at")
+  createdBy String?        @map("created_by")
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @default(now()) @map("updated_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user  User? @relation("PaymentCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("payments")
+}
+
+/// Modelo Invoice: Representa una factura asociada a un pedido.
+/// Campos:
+/// - id: Identificador UUID primario.
+/// - orderId: ID único del pedido asociado (relación 1:1).
+/// - invoiceNumber: Número de factura único (útil para referencia externa / contable).
+/// - issuedAt: Fecha y hora en que se emitió la factura.
+/// - customerName: Nombre del cliente (opcional).
+/// - customerTaxId: Identificación fiscal del cliente (opcional).
+/// - createdAt: Fecha y hora de creación del registro.
+/// - updatedAt: Fecha y hora de la última actualización (requiere actualización manual o middleware).
+/// Relaciones:
+/// - order: Relación con Order (onDelete: Restrict evita borrar pedidos facturados).
+/// - lines: Colección de líneas de factura (InvoiceLine) asociadas.
+/// Notas:
+/// - orderId e invoiceNumber están marcados como únicos para garantizar integridad.
+/// - Considere agregar lógica (middleware Prisma o trigger DB) para mantener updatedAt.
+/// - issuedAt se debe usar para criterios contables y generación de reportes.
+/// - customerTaxId puede ser clave para validaciones fiscales según jurisdicción.
+model Invoice {
+  id            String   @id @default(uuid()) @map("id")
+  orderId       String   @unique @map("order_id")
+  invoiceNumber String   @unique @map("invoice_number")
+  issuedAt      DateTime @default(now()) @map("issued_at")
+  customerName  String?  @map("customer_name")
+  customerTaxId String?  @map("customer_tax_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @default(now()) @map("updated_at")
+
+  order Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  lines InvoiceLine[]
+
+  @@map("invoices")
+}
+
+/// Modelo que representa una línea individual dentro de una factura.
+/// Cada línea describe un ítem o concepto facturado, incluyendo cantidad,
+/// precios, impuestos y el total calculado.
+/// Se vincula a una factura principal mediante `invoiceId`.
+///
+/// Campos:
+/// - id: Identificador único de la línea (UUID).
+/// - invoiceId: Referencia a la factura a la que pertenece esta línea.
+/// - description: Descripción del producto o servicio facturado.
+/// - qty: Cantidad del ítem (permite hasta 3 decimales).
+/// - unitPrice: Precio unitario antes de impuestos (2 decimales).
+/// - taxPercent: Porcentaje de impuesto aplicado a la línea (2 decimales).
+/// - lineTotal: Total de la línea (puede incluir impuestos según lógica de negocio) (2 decimales).
+/// - invoice: Relación con la entidad Invoice; se elimina en cascada si la factura se elimina.
+///
+/// Notas de uso:
+/// - Asegúrate de calcular y asignar `lineTotal` de forma consistente (p.ej. qty * unitPrice * (1 + taxPercent/100)) si aplica.
+/// - `taxPercent` permite manejar diferentes tasas de impuestos por línea.
+/// - Usa transacciones al crear múltiples líneas asociadas a una misma factura para mantener integridad.
+model InvoiceLine {
+  id          String  @id @default(uuid()) @map("id")
+  invoiceId   String  @map("invoice_id")
+  description String  @map("description")
+  qty         Decimal @map("qty") @db.Decimal(10, 3)
+  unitPrice   Decimal @map("unit_price") @db.Decimal(12, 2)
+  taxPercent  Decimal @map("tax_percent") @db.Decimal(5, 2)
+  lineTotal   Decimal @map("line_total") @db.Decimal(12, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@map("invoice_lines")
+}
+
+// ===========================
+// INVENTORY (simple)
+// ===========================
+
+/// Representa un ítem de inventario (materia prima o insumo) disponible en una sucursal específica.
+/// Se identifica de forma única por la combinación (branchId, sku).
+/// Incluye control de stock mínimo, unidad de medida, estado activo/inactivo y soporte de borrado lógico (deletedAt).
+///
+/// Relaciones:
+/// - branch: Sucursal a la que pertenece el ítem. Eliminación en cascada.
+/// - boms: Referencias en listas de materiales (BOM) de productos.
+/// - moves: Movimientos de inventario (entradas / salidas / ajustes).
+///
+/// Campos:
+/// - id: UUID generado automáticamente.
+/// - branchId: ID de la sucursal propietaria.
+/// - sku: Código interno o de catálogo único dentro de la sucursal.
+/// - name: Nombre descriptivo del ítem.
+/// - uom: Unidad de medida (por defecto "unit"; puede representar unidad, kg, lt, etc.).
+/// - minStock: Stock mínimo deseado (Decimal(12,3)) para alertas/planificación.
+/// - isActive: Bandera para activar/desactivar el ítem sin eliminarlo físicamente.
+/// - createdAt / updatedAt: Marcas de tiempo de auditoría.
+/// - deletedAt: Marca de borrado lógico (null si sigue vigente).
+///
+/// Índices y restricciones:
+/// - @@unique([branchId, sku]): Garantiza SKU único dentro de la sucursal.
+///
+/// Notas de uso:
+/// - Utilizar deletedAt para exclusiones suaves; filtrar por deletedAt == null en consultas activas.
+/// - Actualizar updatedAt mediante middleware o lógica de servicio al modificar registros.
+/// - minStock puede emplearse para disparar procesos de reabastecimiento.
+/// - Mantener coherencia de unidad (uom) con los movimientos y BOM para evitar conversiones complejas.
+model StockItem {
+  id        String    @id @default(uuid()) @map("id")
+  branchId  String    @map("branch_id")
+  sku       String    @map("sku")
+  name      String    @map("name")
+  uom       String    @default("unit") @map("uom")
+  minStock  Decimal   @default(0) @map("min_stock") @db.Decimal(12, 3)
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  branch Branch          @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  boms   ProductBOM[]
+  moves  StockMovement[]
+
+  @@unique([branchId, sku])
+  @@map("stock_items")
+}
+
+/// Representa la relación de lista de materiales (Bill of Materials) entre un producto final y un ítem de inventario (StockItem).
+/// Cada registro define la cantidad requerida de un insumo para fabricar una unidad del producto.
+/// Clave primaria compuesta por productId + stockItemId.
+/// onDelete: Cascade en product elimina automáticamente los componentes cuando se elimina el producto.
+/// onDelete: Restrict en stockItem impide eliminar un insumo que aún esté referenciado.
+///
+/// Campos:
+/// - productId: Identificador del producto final.
+/// - stockItemId: Identificador del ítem de inventario (insumo / ingrediente).
+/// - qtyPerUnit: Cantidad del insumo necesaria por unidad de producto (Decimal(12,4)).
+/// - product: Relación al modelo Product.
+/// - stockItem: Relación al modelo StockItem.
+model ProductBOM {
+  productId   String  @map("product_id")
+  stockItemId String  @map("stock_item_id")
+  qtyPerUnit  Decimal @map("qty_per_unit") @db.Decimal(12, 4)
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  stockItem StockItem @relation(fields: [stockItemId], references: [id], onDelete: Restrict)
+
+  @@id([productId, stockItemId])
+  @@map("product_bom")
+}
+
+/// Representa un movimiento de inventario (entrada o salida) de un ítem en una sucursal.
+/// Cada registro ajusta el stock acumulado del artículo en la fecha indicada.
+/// 
+/// Campos:
+/// - id: Identificador único (UUID) del movimiento.
+/// - branchId: Sucursal a la que pertenece el movimiento.
+/// - stockItemId: Ítem de inventario afectado.
+/// - movementDate: Fecha y hora del registro (por defecto el momento de creación).
+/// - qtyChange: Cantidad que varía el stock (positivo = aumenta, negativo = disminuye).
+/// - reason: Motivo descriptivo del ajuste (ej: venta, compra, corrección, merma, traslado).
+/// - reference: Referencia externa opcional (pedido, factura, ajuste, etc.).
+/// - createdBy: Usuario que creó el registro (nulo si fue generado automáticamente).
+/// 
+/// Relaciones:
+/// - branch: Sucursal (Branch). onDelete: Cascade (al eliminar la sucursal se eliminan sus movimientos).
+/// - stockItem: Artículo (StockItem). onDelete: Restrict (no se puede eliminar si hay movimientos históricos).
+/// - user: Usuario creador (User). onDelete: SetNull (se mantiene el histórico aunque el usuario se elimine).
+/// 
+/// Índices:
+/// - (branchId, stockItemId, movementDate): Optimiza consultas por sucursal, artículo y orden cronológico.
+/// 
+/// Buenas prácticas:
+/// - Tratar los movimientos como inmutables: no editar; agregar uno nuevo para correcciones.
+/// - Calcular stock actual sumando qtyChange ordenados por movementDate (y por id como desempate si aplica).
+/// - Estandarizar reason (lista controlada) para mejorar reportes.
+/// - Usar reference para trazabilidad con documentos externos (ventas, compras, ajustes).
+/// - Validar que qtyChange != 0 para evitar ruido en el historial.
+/// - Considerar transacciones al insertar múltiples movimientos relacionados (ej: desgloses de producción).
+model StockMovement {
+  id           String   @id @default(uuid()) @map("id")
+  branchId     String   @map("branch_id")
+  stockItemId  String   @map("stock_item_id")
+  movementDate DateTime @default(now()) @map("movement_date")
+  qtyChange    Decimal  @map("qty_change") @db.Decimal(14, 4)
+  reason       String   @map("reason")
+  reference    String?  @map("reference")
+  createdBy    String?  @map("created_by")
+
+  branch    Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  stockItem StockItem @relation(fields: [stockItemId], references: [id], onDelete: Restrict)
+  user      User?     @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([branchId, stockItemId, movementDate])
+  @@map("stock_movements")
+}
