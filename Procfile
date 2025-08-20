@@ -1,1 +1,4 @@
-web: npm install --only=prod && npm run start
+# Procfile
+
+release: npx prisma migrate deploy
+web: node dist/src/main.js
