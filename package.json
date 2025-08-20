@@ -24,8 +24,7 @@
     "prisma:migrate:dev": "prisma migrate dev",
     "db:reset": "prisma migrate reset --skip-generate --skip-seed",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "prisma:seed": "ts-node --transpile-only prisma/seed.ts",
-    "heroku-postbuild": "npm ci --ignore-scripts=false && npm run build"
+    "prisma:seed": "ts-node --transpile-only prisma/seed.ts"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.3",
