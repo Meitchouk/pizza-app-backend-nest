@@ -25,7 +25,6 @@
     "db:reset": "prisma migrate reset --skip-generate --skip-seed",
     "prisma:migrate:deploy": "prisma migrate deploy",
     "prisma:seed": "ts-node --transpile-only prisma/seed.ts",
-    "postinstall": "prisma generate",
     "heroku-postbuild": "npm run build"
   },
   "dependencies": {
