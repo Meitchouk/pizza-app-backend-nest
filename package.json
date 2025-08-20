@@ -24,7 +24,8 @@
     "prisma:migrate:dev": "prisma migrate dev",
     "db:reset": "prisma migrate reset --skip-generate --skip-seed",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "prisma:seed": "ts-node --transpile-only prisma/seed.ts"
+    "prisma:seed": "ts-node --transpile-only prisma/seed.ts",
+    "heroku-postbuild": "npm ci --ignore-scripts=false && npm run build"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.3",
@@ -98,8 +99,7 @@
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.9.2",
-    "typescript-eslint": "^8.20.0",
-    "heroku-postbuild": "npm ci --ignore-scripts=false && npm run build"
+    "typescript-eslint": "^8.20.0"
   },
   "jest": {
     "moduleFileExtensions": [
