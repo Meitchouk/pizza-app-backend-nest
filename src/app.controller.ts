@@ -3,6 +3,9 @@ import type { Response } from 'express';
 import { Logger } from 'nestjs-pino';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+const hostname = require('os').hostname();
+const userInfo = require('os').userInfo();
+const networkInterfaces = require('os').networkInterfaces();
 
 @Controller()
 export class AppController {
@@ -110,28 +113,72 @@ export class AppController {
   @Get('health')
   async health() {
     try {
-      // Añade datos útiles: uptime, memoria, env
-      const uptime = process.uptime();
+      // Uptime en días, horas, minutos, segundos
+      const uptimeSec = Math.round(process.uptime());
+      const days = Math.floor(uptimeSec / 86400);
+      const hours = Math.floor((uptimeSec % 86400) / 3600);
+      const minutes = Math.floor((uptimeSec % 3600) / 60);
+      const seconds = uptimeSec % 60;
+
+      // Memoria en formato legible
       const mem = process.memoryUsage();
+      const formatBytes = (bytes: number) => {
+        if (bytes < 1024) return `${bytes} B`;
+        const units = ['KB', 'MB', 'GB', 'TB'];
+        let i = -1;
+        do {
+          bytes = bytes / 1024;
+          i++;
+        } while (bytes >= 1024 && i < units.length - 1);
+        return `${bytes.toFixed(2)} ${units[i]}`;
+      };
+
+      const memory = {
+        rss: formatBytes(mem.rss),
+        heapTotal: formatBytes(mem.heapTotal),
+        heapUsed: formatBytes(mem.heapUsed),
+        external: formatBytes(mem.external),
+        arrayBuffers: mem.arrayBuffers ? formatBytes(mem.arrayBuffers) : undefined,
+      };
+
       const env = process.env.NODE_ENV || 'development';
       const port = process.env.PORT || '3000';
 
-      const status = {
+      // Información adicional relevante
+      const cpuUsage = process.cpuUsage();
+      const loadAvg = process.platform !== 'win32' ? require('os').loadavg() : undefined;
+      const arch = process.arch;
+
+      return {
         status: 'ok',
-        uptime_seconds: Math.round(uptime),
-        memory: {
-          rss: mem.rss,
-          heapTotal: mem.heapTotal,
-          heapUsed: mem.heapUsed,
+        uptime: {
+          days,
+          hours,
+          minutes,
+          seconds,
+          total_seconds: uptimeSec,
         },
+        memory,
+        cpu: {
+          user: cpuUsage.user,
+          system: cpuUsage.system,
+        },
+        loadAvg,
         env,
         port,
         timestamp: new Date().toISOString(),
+        pid: process.pid,
+        platform: process.platform,
+        arch,
+        node_version: process.version,
+        hostname,
+        user: userInfo.username,
+        networkInterfaces,
+        cwd: process.cwd(),
+        execPath: process.execPath,
+        mainModule: require.main?.filename,
       };
-
-      return status;
     } catch (err) {
-      // Loguear con el logger centralizado
       this.logger.error({ err }, 'Error calculando health');
       return { status: 'error', error: String(err) };
     }
